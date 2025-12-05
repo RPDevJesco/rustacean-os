@@ -1,0 +1,26 @@
+# Rustacean OS .gitignore
+
+# Build outputs
+/build/
+/output/
+*.img
+*.bin
+
+# Rust build artifacts
+/kernel/target/
+**/*.rs.bk
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Archives
+*.tar.gz
+*.zip
