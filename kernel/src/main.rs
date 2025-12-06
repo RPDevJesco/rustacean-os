@@ -103,7 +103,7 @@ extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
         vga.add(1).write_volatile(0x2F);
     }
     
-    // Initialize VGA/VESA display
+    // Initialize VGA/VESA display (temporary, for boot messages)
     unsafe {
         if boot_info.vesa_enabled {
             vga::init_framebuffer(
@@ -194,45 +194,120 @@ extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
     }
 }
 
-/// Run the graphical user interface
+/// Run the graphical user interface with native driver support
 fn run_gui(fb_addr: u32, width: u32, height: u32, bpp: u32, pitch: u32) -> ! {
-    // Initialize framebuffer
-    unsafe {
-        gui::framebuffer::init(fb_addr as *mut u8, width, height, bpp, pitch);
+    // Track which drivers we're using
+    let mut using_native_gpu = false;
+    let mut using_synaptics = false;
+    
+    // Final framebuffer parameters (may be updated by native GPU driver)
+    let mut final_fb_addr = fb_addr;
+    let mut final_width = width;
+    let mut final_height = height;
+    let mut final_bpp = bpp;
+    let mut final_pitch = pitch;
+    
+    // =========================================================================
+    // Try to initialize native ATI Rage Mobility P GPU driver
+    // =========================================================================
+    match drivers::ati_rage::init() {
+        Ok(()) => {
+            if let Some(gpu) = drivers::ati_rage::get() {
+                // Try to set our preferred mode (800x600 for Plan 9 style)
+                let mode = drivers::ati_rage::DisplayMode::mode_800x600_60();
+                match gpu.set_mode(&mode, 32) {
+                    Ok(()) => {
+                        // Update framebuffer parameters from native driver
+                        final_fb_addr = gpu.framebuffer_addr();
+                        final_width = gpu.width();
+                        final_height = gpu.height();
+                        final_bpp = gpu.bpp() / 8;
+                        final_pitch = gpu.pitch();
+                        using_native_gpu = true;
+                        
+                        // Enable hardware cursor for flicker-free pointer
+                        gpu.enable_hw_cursor();
+                    }
+                    Err(_e) => {
+                        // Mode set failed, continue with VESA framebuffer
+                    }
+                }
+            }
+        }
+        Err(_e) => {
+            // ATI Rage not found or init failed, continue with VESA
+        }
     }
     
-    // Initialize mouse (may not work on all trackpads)
-    drivers::mouse::init(width, height);
+    // =========================================================================
+    // Initialize framebuffer (native or VESA)
+    // =========================================================================
+    unsafe {
+        gui::framebuffer::init(
+            final_fb_addr as *mut u8, 
+            final_width, 
+            final_height, 
+            final_bpp, 
+            final_pitch
+        );
+    }
     
-    // Initialize desktop
-    gui::desktop::init(width, height);
+    // =========================================================================
+    // Try to initialize Synaptics touchpad, fall back to generic PS/2 mouse
+    // =========================================================================
+    match drivers::synaptics::init(final_width, final_height) {
+        Ok(()) => {
+            if drivers::synaptics::is_synaptics() {
+                using_synaptics = true;
+                // Optionally configure touchpad settings
+                unsafe {
+                    drivers::synaptics::TOUCHPAD.set_tap_enabled(true);
+                    drivers::synaptics::TOUCHPAD.set_sensitivity(300); // Slightly higher than default
+                }
+            } else {
+                // Detected as generic PS/2 mouse via Synaptics driver
+                using_synaptics = true; // Still use synaptics driver in relative mode
+            }
+        }
+        Err(_e) => {
+            // Synaptics init failed, fall back to original mouse driver
+            drivers::mouse::init(final_width, final_height);
+            using_synaptics = false;
+        }
+    }
     
-    // Get desktop and framebuffer
+    // =========================================================================
+    // Initialize desktop window manager
+    // =========================================================================
+    gui::desktop::init(final_width, final_height);
+    
     let desktop = gui::desktop::get().expect("Desktop not initialized");
     let fb = gui::framebuffer::get().expect("Framebuffer not initialized");
     
-    // Create some demo windows
+    // Create demo windows
     desktop.create_window("Welcome to Rustacean OS!", 50, 50, 450, 250);
     desktop.create_window("Terminal", 100, 150, 500, 300);
     desktop.create_window("Files", 520, 80, 300, 250);
     
-    // Add welcome text to first window
     desktop.mark_dirty();
     
+    // =========================================================================
     // Main GUI event loop
-    let mut last_mouse_x = 0i32;
-    let mut last_mouse_y = 0i32;
+    // =========================================================================
+    let mut last_mouse_x = (final_width / 2) as i32;
+    let mut last_mouse_y = (final_height / 2) as i32;
     let mut last_buttons = 0u8;
     
-    // Keyboard-controlled cursor position
-    let mut kb_cursor_x = (width / 2) as i32;
-    let mut kb_cursor_y = (height / 2) as i32;
+    // Keyboard-controlled cursor (fallback)
+    let mut kb_cursor_x = last_mouse_x;
+    let mut kb_cursor_y = last_mouse_y;
     let cursor_speed = 8i32;
     
     loop {
-        // Check for keyboard input (arrow keys move cursor, Enter = click)
+        // =====================================================================
+        // Handle keyboard input (fallback cursor control + future use)
+        // =====================================================================
         let scancode = unsafe { 
-            // Check if key available
             let status = crate::arch::x86::io::inb(0x64);
             if status & 0x01 != 0 {
                 Some(crate::arch::x86::io::inb(0x60))
@@ -247,13 +322,13 @@ fn run_gui(fb_addr: u32, width: u32, height: u32, bpp: u32, pitch: u32) -> ! {
             
             if pressed {
                 match key {
-                    // Arrow keys (using scancodes)
+                    // Arrow keys
                     0x48 => { // Up
                         kb_cursor_y = (kb_cursor_y - cursor_speed).max(0);
                         desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
                     }
                     0x50 => { // Down
-                        kb_cursor_y = (kb_cursor_y + cursor_speed).min(height as i32 - 1);
+                        kb_cursor_y = (kb_cursor_y + cursor_speed).min(final_height as i32 - 1);
                         desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
                     }
                     0x4B => { // Left
@@ -261,12 +336,11 @@ fn run_gui(fb_addr: u32, width: u32, height: u32, bpp: u32, pitch: u32) -> ! {
                         desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
                     }
                     0x4D => { // Right
-                        kb_cursor_x = (kb_cursor_x + cursor_speed).min(width as i32 - 1);
+                        kb_cursor_x = (kb_cursor_x + cursor_speed).min(final_width as i32 - 1);
                         desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
                     }
                     0x1C => { // Enter = left click
                         desktop.handle_mouse_button(gui::MouseButton::Left, true);
-                        // Small delay then release
                         for _ in 0..100000u32 { unsafe { core::arch::asm!("nop"); } }
                         desktop.handle_mouse_button(gui::MouseButton::Left, false);
                     }
@@ -279,7 +353,7 @@ fn run_gui(fb_addr: u32, width: u32, height: u32, bpp: u32, pitch: u32) -> ! {
                         desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
                     }
                     0x1F => { // S
-                        kb_cursor_y = (kb_cursor_y + cursor_speed).min(height as i32 - 1);
+                        kb_cursor_y = (kb_cursor_y + cursor_speed).min(final_height as i32 - 1);
                         desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
                     }
                     0x1E => { // A
@@ -287,7 +361,7 @@ fn run_gui(fb_addr: u32, width: u32, height: u32, bpp: u32, pitch: u32) -> ! {
                         desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
                     }
                     0x20 => { // D
-                        kb_cursor_x = (kb_cursor_x + cursor_speed).min(width as i32 - 1);
+                        kb_cursor_x = (kb_cursor_x + cursor_speed).min(final_width as i32 - 1);
                         desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
                     }
                     _ => {}
@@ -300,16 +374,34 @@ fn run_gui(fb_addr: u32, width: u32, height: u32, bpp: u32, pitch: u32) -> ! {
             }
         }
         
-        // Check for mouse updates (may work on some systems)
-        let (mouse_x, mouse_y) = drivers::mouse::get_position();
-        let buttons = drivers::mouse::get_buttons();
+        // =====================================================================
+        // Handle pointing device input (Synaptics or generic PS/2)
+        // =====================================================================
+        let (mouse_x, mouse_y, buttons) = if using_synaptics {
+            let (x, y) = drivers::synaptics::get_position();
+            let btns = drivers::synaptics::get_buttons();
+            (x, y, btns)
+        } else {
+            let (x, y) = drivers::mouse::get_position();
+            let btns = drivers::mouse::get_buttons();
+            (x, y, btns)
+        };
         
-        // Handle mouse movement
+        // Handle pointer movement
         if mouse_x != last_mouse_x || mouse_y != last_mouse_y {
             desktop.handle_mouse_move(mouse_x, mouse_y);
-            // Sync keyboard cursor with mouse
+            
+            // Sync keyboard cursor with pointer
             kb_cursor_x = mouse_x;
             kb_cursor_y = mouse_y;
+            
+            // Update hardware cursor if using native GPU
+            if using_native_gpu {
+                if let Some(gpu) = drivers::ati_rage::get() {
+                    gpu.set_cursor_pos(mouse_x, mouse_y);
+                }
+            }
+            
             last_mouse_x = mouse_x;
             last_mouse_y = mouse_y;
         }
@@ -322,13 +414,20 @@ fn run_gui(fb_addr: u32, width: u32, height: u32, bpp: u32, pitch: u32) -> ! {
             if (buttons & 0x02) != (last_buttons & 0x02) {
                 desktop.handle_mouse_button(gui::MouseButton::Right, buttons & 0x02 != 0);
             }
+            if (buttons & 0x04) != (last_buttons & 0x04) {
+                desktop.handle_mouse_button(gui::MouseButton::Middle, buttons & 0x04 != 0);
+            }
             last_buttons = buttons;
         }
         
+        // =====================================================================
         // Draw the desktop
+        // =====================================================================
         desktop.draw(fb);
         
-        // Small yield
-        for _ in 0..10000u32 { unsafe { core::arch::asm!("nop"); } }
+        // Small yield to prevent CPU spinning at 100%
+        for _ in 0..10000u32 { 
+            unsafe { core::arch::asm!("nop"); } 
+        }
     }
 }

@@ -692,7 +692,7 @@ protected_mode_entry:
     ; Debug: Write '!' to top-left corner of VGA text buffer
     mov     byte [0xB8000], '!'
     mov     byte [0xB8001], 0x4F      ; White on red - visible!
-    
+
     mov     eax, 0x500          ; Boot info pointer
     jmp     0x100000            ; Jump to kernel at 1MB
 

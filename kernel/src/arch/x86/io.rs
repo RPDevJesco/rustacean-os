@@ -81,3 +81,51 @@ pub unsafe fn io_wait() {
     // This port is used for POST codes and is safe to write to
     outb(0x80, 0);
 }
+
+/// Read multiple bytes from an I/O port (string I/O)
+#[inline]
+pub unsafe fn insb(port: u16, buf: &mut [u8]) {
+    for i in 0..buf.len() {
+        buf[i] = inb(port);
+    }
+}
+
+/// Write multiple bytes to an I/O port (string I/O)
+#[inline]
+pub unsafe fn outsb(port: u16, buf: &[u8]) {
+    for &byte in buf {
+        outb(port, byte);
+    }
+}
+
+/// Read multiple words from an I/O port (string I/O)
+#[inline]
+pub unsafe fn insw(port: u16, buf: &mut [u16]) {
+    for i in 0..buf.len() {
+        buf[i] = inw(port);
+    }
+}
+
+/// Write multiple words to an I/O port (string I/O)
+#[inline]
+pub unsafe fn outsw(port: u16, buf: &[u16]) {
+    for &word in buf {
+        outw(port, word);
+    }
+}
+
+/// Read multiple dwords from an I/O port (string I/O)
+#[inline]
+pub unsafe fn insl(port: u16, buf: &mut [u32]) {
+    for i in 0..buf.len() {
+        buf[i] = inl(port);
+    }
+}
+
+/// Write multiple dwords to an I/O port (string I/O)
+#[inline]
+pub unsafe fn outsl(port: u16, buf: &[u32]) {
+    for &dword in buf {
+        outl(port, dword);
+    }
+}

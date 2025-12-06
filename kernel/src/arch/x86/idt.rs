@@ -35,7 +35,7 @@ impl IdtEntry {
             offset_high: 0,
         }
     }
-    
+
     /// Create an interrupt gate entry
     pub const fn interrupt_gate(handler: u32, selector: u16, dpl: u8) -> Self {
         Self {
@@ -47,7 +47,7 @@ impl IdtEntry {
             offset_high: ((handler >> 16) & 0xFFFF) as u16,
         }
     }
-    
+
     /// Create a trap gate entry (doesn't disable interrupts)
     pub const fn trap_gate(handler: u32, selector: u16, dpl: u8) -> Self {
         Self {
@@ -59,7 +59,7 @@ impl IdtEntry {
             offset_high: ((handler >> 16) & 0xFFFF) as u16,
         }
     }
-    
+
     /// Set the handler address
     pub fn set_handler(&mut self, handler: u32) {
         self.offset_low = (handler & 0xFFFF) as u16;
@@ -93,6 +93,9 @@ static mut IDT_PTR: IdtPointer = IdtPointer {
     limit: 0,
     base: 0,
 };
+
+/// Simple tick counter for timer (if PIT module not available)
+static mut TICK_COUNT: u32 = 0;
 
 /// Interrupt frame pushed by CPU
 #[derive(Debug, Clone, Copy)]
@@ -143,6 +146,7 @@ extern "C" {
     fn isr_stub_default();
     fn irq_stub_0();
     fn irq_stub_1();
+    fn irq_stub_12();
     fn irq_stub_default();
 }
 
@@ -296,6 +300,12 @@ global_asm!(
     "    push 33",             // IRQ 1 = INT 33
     "    jmp isr_common",
 
+    ".global irq_stub_12",
+    "irq_stub_12:",
+    "    push 0",
+    "    push 44",             // IRQ 12 = INT 44 (mouse/touchpad)
+    "    jmp isr_common",
+
     ".global irq_stub_default",
     "irq_stub_default:",
     "    push 0",
@@ -307,23 +317,23 @@ global_asm!(
 pub fn init() {
     // Initialize PIC first
     pic::init();
-    
+
     unsafe {
         // Set up CPU exception handlers (interrupts 0-31)
         set_exception_handlers();
-        
+
         // Set up IRQ handlers (interrupts 32-47)
         set_irq_handlers();
-        
+
         // Set up IDT pointer
         IDT_PTR.limit = (size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16;
         IDT_PTR.base = IDT.0.as_ptr() as u32;
-        
+
         // Load IDT
         core::arch::asm!(
-            "lidt [{}]",
-            in(reg) &IDT_PTR,
-            options(nostack, preserves_flags)
+        "lidt [{}]",
+        in(reg) &IDT_PTR,
+        options(nostack, preserves_flags)
         );
     }
 }
@@ -350,7 +360,7 @@ unsafe fn set_exception_handlers() {
     IDT.0[17] = IdtEntry::interrupt_gate(isr_stub_17 as u32, selectors::KERNEL_CODE, 0);
     IDT.0[18] = IdtEntry::interrupt_gate(isr_stub_18 as u32, selectors::KERNEL_CODE, 0);
     IDT.0[19] = IdtEntry::interrupt_gate(isr_stub_19 as u32, selectors::KERNEL_CODE, 0);
-    
+
     // Fill rest of exceptions with default handler
     for i in 20..32 {
         IDT.0[i] = IdtEntry::interrupt_gate(isr_stub_default as u32, selectors::KERNEL_CODE, 0);
@@ -359,11 +369,21 @@ unsafe fn set_exception_handlers() {
 
 /// Set up IRQ handlers (PIC interrupts mapped to 32-47)
 unsafe fn set_irq_handlers() {
+    // IRQ 0 - Timer (INT 32)
     IDT.0[32] = IdtEntry::interrupt_gate(irq_stub_0 as u32, selectors::KERNEL_CODE, 0);
+    // IRQ 1 - Keyboard (INT 33)
     IDT.0[33] = IdtEntry::interrupt_gate(irq_stub_1 as u32, selectors::KERNEL_CODE, 0);
-    
-    // IRQ 2-15 use default handler
-    for i in 2..16 {
+
+    // IRQ 2-11 use default handler
+    for i in 2..12 {
+        IDT.0[32 + i] = IdtEntry::interrupt_gate(irq_stub_default as u32, selectors::KERNEL_CODE, 0);
+    }
+
+    // IRQ 12 - PS/2 Mouse/Touchpad (INT 44) - dedicated handler
+    IDT.0[44] = IdtEntry::interrupt_gate(irq_stub_12 as u32, selectors::KERNEL_CODE, 0);
+
+    // IRQ 13-15 use default handler
+    for i in 13..16 {
         IDT.0[32 + i] = IdtEntry::interrupt_gate(irq_stub_default as u32, selectors::KERNEL_CODE, 0);
     }
 }
@@ -372,7 +392,7 @@ unsafe fn set_irq_handlers() {
 #[no_mangle]
 extern "C" fn interrupt_handler(frame: &InterruptFrame) {
     let int_num = frame.interrupt_number;
-    
+
     match int_num {
         // CPU Exceptions
         0 => exception_handler("Division by zero", frame),
@@ -380,17 +400,17 @@ extern "C" fn interrupt_handler(frame: &InterruptFrame) {
         8 => exception_handler("Double fault", frame),
         13 => exception_handler("General protection fault", frame),
         14 => page_fault_handler(frame),
-        
+
         // IRQs (32-47)
         32 => timer_handler(),
         33 => keyboard_handler(),
         44 => mouse_handler(),  // IRQ12 = interrupt 44
-        
+
         // Other IRQs
         32..=47 => {
             pic::send_eoi(int_num as u8);
         }
-        
+
         _ => {
             // Unknown interrupt
         }
@@ -398,15 +418,57 @@ extern "C" fn interrupt_handler(frame: &InterruptFrame) {
 }
 
 fn exception_handler(name: &str, frame: &InterruptFrame) {
+    // Write directly to VGA buffer for debugging
     unsafe {
+        let vga = 0xB8000 as *mut u8;
+
+        // Clear first line and write exception name
+        for i in 0..80 {
+            vga.add(i * 2).write_volatile(b' ');
+            vga.add(i * 2 + 1).write_volatile(0x4F); // White on red
+        }
+
+        // Write "EXCEPTION: " prefix
+        let prefix = b"EXCEPTION: ";
+        for (i, &c) in prefix.iter().enumerate() {
+            vga.add(i * 2).write_volatile(c);
+        }
+
+        // Write exception name
+        for (i, c) in name.bytes().enumerate() {
+            vga.add((prefix.len() + i) * 2).write_volatile(c);
+        }
+
+        // Write EIP on second line
+        let eip_prefix = b"EIP: 0x";
+        let line2 = 160; // Second line starts at offset 160
+        for (i, &c) in eip_prefix.iter().enumerate() {
+            vga.add(line2 + i * 2).write_volatile(c);
+            vga.add(line2 + i * 2 + 1).write_volatile(0x4F);
+        }
+
+        // Write EIP as hex
+        let eip = frame.eip;
+        for i in 0..8 {
+            let nibble = ((eip >> (28 - i * 4)) & 0xF) as u8;
+            let c = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
+            vga.add(line2 + (eip_prefix.len() + i) * 2).write_volatile(c);
+            vga.add(line2 + (eip_prefix.len() + i) * 2 + 1).write_volatile(0x4F);
+        }
+
+        // Also try the VGA writer if available
         if let Some(writer) = crate::drivers::vga::WRITER.as_mut() {
             use core::fmt::Write;
             let _ = writeln!(writer, "\n!!! EXCEPTION: {} !!!", name);
             let _ = writeln!(writer, "EIP: 0x{:08X}", frame.eip);
             let _ = writeln!(writer, "Error code: 0x{:08X}", frame.error_code);
+            let _ = writeln!(writer, "EAX: 0x{:08X}  EBX: 0x{:08X}", frame.eax, frame.ebx);
+            let _ = writeln!(writer, "ECX: 0x{:08X}  EDX: 0x{:08X}", frame.ecx, frame.edx);
+            let _ = writeln!(writer, "ESI: 0x{:08X}  EDI: 0x{:08X}", frame.esi, frame.edi);
+            let _ = writeln!(writer, "EBP: 0x{:08X}  CS:  0x{:04X}", frame.ebp, frame.cs);
         }
     }
-    
+
     loop {
         unsafe { core::arch::asm!("cli; hlt"); }
     }
@@ -417,43 +479,104 @@ fn page_fault_handler(frame: &InterruptFrame) {
     unsafe {
         core::arch::asm!("mov {}, cr2", out(reg) fault_addr);
     }
-    
+
+    // Write to VGA text buffer directly
     unsafe {
+        let vga = 0xB8000 as *mut u8;
+
+        // Clear first line
+        for i in 0..80 {
+            vga.add(i * 2).write_volatile(b' ');
+            vga.add(i * 2 + 1).write_volatile(0x4F);
+        }
+
+        let msg = b"PAGE FAULT at 0x";
+        for (i, &c) in msg.iter().enumerate() {
+            vga.add(i * 2).write_volatile(c);
+        }
+
+        // Write fault address as hex
+        for i in 0..8 {
+            let nibble = ((fault_addr >> (28 - i * 4)) & 0xF) as u8;
+            let c = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
+            vga.add((msg.len() + i) * 2).write_volatile(c);
+        }
+
         if let Some(writer) = crate::drivers::vga::WRITER.as_mut() {
             use core::fmt::Write;
             let _ = writeln!(writer, "\n!!! PAGE FAULT !!!");
             let _ = writeln!(writer, "Faulting address: 0x{:08X}", fault_addr);
             let _ = writeln!(writer, "EIP: 0x{:08X}", frame.eip);
             let _ = writeln!(writer, "Error code: 0x{:08X}", frame.error_code);
+
+            // Decode error code
+            let present = (frame.error_code & 0x01) != 0;
+            let write = (frame.error_code & 0x02) != 0;
+            let user = (frame.error_code & 0x04) != 0;
+            let reserved = (frame.error_code & 0x08) != 0;
+            let _ = writeln!(writer, "  Present: {}, Write: {}, User: {}, Reserved: {}",
+                             present, write, user, reserved);
         }
     }
-    
+
     loop {
         unsafe { core::arch::asm!("cli; hlt"); }
     }
 }
 
 fn timer_handler() {
+    // Increment local tick counter
+    // If you have a PIT module, replace this with: crate::arch::x86::pit::tick();
+    unsafe {
+        TICK_COUNT = TICK_COUNT.wrapping_add(1);
+    }
+
     pic::send_eoi(32);
+}
+
+/// Get current tick count
+pub fn ticks() -> u32 {
+    unsafe { TICK_COUNT }
 }
 
 fn keyboard_handler() {
     let scancode = unsafe { super::io::inb(0x60) };
-    
+
     // Process through keyboard driver
     unsafe {
         if let Some(_event) = crate::drivers::keyboard::KEYBOARD.process_scancode(scancode) {
             // Event will be handled by GUI event loop
         }
     }
-    
+
     pic::send_eoi(33);
 }
 
+/// Mouse/Touchpad IRQ handler
+/// Routes to Synaptics driver if initialized, otherwise to generic PS/2 mouse
 fn mouse_handler() {
-    // Let the mouse driver process the byte
-    crate::drivers::mouse::handle_irq();
-    
+    // Check if data is from mouse (bit 5 of status indicates AUX data)
+    let status = unsafe { super::io::inb(0x64) };
+    if status & 0x20 == 0 {
+        // Not mouse data, send EOI and return
+        pic::send_eoi(44);
+        return;
+    }
+
+    // Read the data byte
+    let byte = unsafe { super::io::inb(0x60) };
+
+    // Route to appropriate driver based on what's initialized
+    // Check Synaptics first (preferred driver)
+    if crate::drivers::synaptics::is_initialized() {
+        crate::drivers::synaptics::handle_irq_byte(byte);
+    } else {
+        // Fall back to generic PS/2 mouse driver
+        unsafe {
+            crate::drivers::mouse::MOUSE.process_byte(byte);
+        }
+    }
+
     // IRQ12 is on the slave PIC, so we need to send EOI to both
     pic::send_eoi(44);
 }
