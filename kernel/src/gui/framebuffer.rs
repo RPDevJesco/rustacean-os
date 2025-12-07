@@ -273,6 +273,66 @@ impl Framebuffer {
         self.draw_hline(x, y + h as i32 - 1, w, br);
         self.draw_vline(x + w as i32 - 1, y, h, br);
     }
+
+    /// Fast copy entire contents from another framebuffer
+    ///
+    /// Used for double buffering - copy back buffer to front buffer in one go.
+    /// Both framebuffers must have the same dimensions and format.
+    pub fn copy_from(&mut self, src: &Framebuffer) {
+        // Safety check
+        if self.width != src.width || self.height != src.height || self.bpp != src.bpp {
+            return;
+        }
+
+        // Fast path: if pitch matches, single memcpy
+        if self.pitch == src.pitch {
+            let total_bytes = (self.pitch * self.height) as usize;
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.buffer, self.buffer, total_bytes);
+            }
+        } else {
+            // Slow path: copy row by row (handles different padding)
+            let row_bytes = (self.width * self.bpp) as usize;
+            for y in 0..self.height {
+                let src_offset = (y * src.pitch) as usize;
+                let dst_offset = (y * self.pitch) as usize;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src.buffer.add(src_offset),
+                        self.buffer.add(dst_offset),
+                        row_bytes,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Copy a rectangular region from another framebuffer
+    /// Useful for partial updates
+    pub fn copy_rect_from(&mut self, src: &Framebuffer, rect: Rect) {
+        let x0 = rect.x.max(0) as u32;
+        let y0 = rect.y.max(0) as u32;
+        let x1 = ((rect.x + rect.width as i32) as u32).min(self.width).min(src.width);
+        let y1 = ((rect.y + rect.height as i32) as u32).min(self.height).min(src.height);
+
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        let copy_width = ((x1 - x0) * self.bpp) as usize;
+
+        for y in y0..y1 {
+            let src_offset = (y * src.pitch + x0 * src.bpp) as usize;
+            let dst_offset = (y * self.pitch + x0 * self.bpp) as usize;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.buffer.add(src_offset),
+                    self.buffer.add(dst_offset),
+                    copy_width
+                );
+            }
+        }
+    }
 }
 
 // Global framebuffer instance

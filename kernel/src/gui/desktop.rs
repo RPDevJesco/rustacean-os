@@ -1,6 +1,9 @@
 //! Desktop / Window Manager
 //!
 //! Manages windows, mouse cursor, and desktop events.
+//!
+//! Uses double buffering for windows (no flicker) but draws cursor
+//! directly to screen for maximum responsiveness.
 
 use super::{Window, Framebuffer, Color, Rect, Point, theme, font, GuiEvent, MouseButton};
 
@@ -73,9 +76,9 @@ pub struct Desktop {
     screen_height: u32,
     /// Next window ID
     next_id: u32,
-    /// Desktop needs full redraw
+    /// Desktop needs full redraw (windows changed)
     dirty: bool,
-    /// Saved pixels under cursor
+    /// Saved pixels under cursor (from front buffer)
     cursor_save: [Color; 256], // 16x16
     cursor_save_x: i32,
     cursor_save_y: i32,
@@ -85,7 +88,7 @@ impl Desktop {
     /// Create a new desktop
     pub fn new(screen_width: u32, screen_height: u32) -> Self {
         const NONE_WINDOW: Option<Window> = None;
-        
+
         Self {
             windows: [NONE_WINDOW; MAX_WINDOWS],
             z_order: [0; MAX_WINDOWS],
@@ -105,71 +108,42 @@ impl Desktop {
             cursor_save_y: -1,
         }
     }
-    
+
     /// Create a new window
     pub fn create_window(&mut self, title: &str, x: i32, y: i32, width: u32, height: u32) -> Option<u32> {
         // Find free slot
         let slot = self.windows.iter().position(|w| w.is_none())?;
-        
+
+        if self.window_count >= MAX_WINDOWS {
+            return None;
+        }
+
         let id = self.next_id;
         self.next_id += 1;
-        
-        let mut window = Window::new(id, title, x, y, width, height);
-        window.flags.focused = self.window_count == 0;
-        
+
+        let window = Window::new(id, title, x, y, width, height);
         self.windows[slot] = Some(window);
-        self.z_order[self.window_count] = slot;
-        self.window_count += 1;
-        
-        if self.focused.is_none() {
-            self.focused = Some(slot);
+
+        // Add to front of z-order
+        for i in (1..=self.window_count).rev() {
+            self.z_order[i] = self.z_order[i - 1];
         }
-        
+        self.z_order[0] = slot;
+        self.window_count += 1;
+
+        // Focus new window
+        self.focused = Some(slot);
+        if let Some(ref mut win) = self.windows[slot] {
+            win.flags.focused = true;
+        }
+
         self.dirty = true;
         Some(id)
     }
-    
-    /// Close a window by ID
-    pub fn close_window(&mut self, id: u32) {
-        if let Some(slot) = self.find_window_slot(id) {
-            self.windows[slot] = None;
-            
-            // Remove from z_order
-            if let Some(z_pos) = self.z_order[..self.window_count].iter().position(|&s| s == slot) {
-                for i in z_pos..self.window_count - 1 {
-                    self.z_order[i] = self.z_order[i + 1];
-                }
-                self.window_count -= 1;
-            }
-            
-            // Update focus
-            if self.focused == Some(slot) {
-                self.focused = if self.window_count > 0 {
-                    Some(self.z_order[0])
-                } else {
-                    None
-                };
-            }
-            
-            self.dirty = true;
-        }
-    }
-    
-    /// Get a window by ID
-    pub fn get_window(&mut self, id: u32) -> Option<&mut Window> {
-        self.find_window_slot(id)
-            .and_then(|slot| self.windows[slot].as_mut())
-    }
-    
-    /// Find window slot by ID
-    fn find_window_slot(&self, id: u32) -> Option<usize> {
-        self.windows.iter().position(|w| {
-            w.as_ref().map_or(false, |win| win.id == id)
-        })
-    }
-    
-    /// Find window at screen position (top-most first)
-    fn window_at(&self, x: i32, y: i32) -> Option<usize> {
+
+    /// Find window at screen coordinates
+    pub fn window_at(&self, x: i32, y: i32) -> Option<usize> {
+        // Search front to back (z_order[0] is frontmost)
         for i in 0..self.window_count {
             let slot = self.z_order[i];
             if let Some(ref window) = self.windows[slot] {
@@ -180,9 +154,9 @@ impl Desktop {
         }
         None
     }
-    
-    /// Bring window to front
-    fn bring_to_front(&mut self, slot: usize) {
+
+    /// Bring a window to the front
+    pub fn bring_to_front(&mut self, slot: usize) {
         if let Some(z_pos) = self.z_order[..self.window_count].iter().position(|&s| s == slot) {
             // Shift others back
             for i in (1..=z_pos).rev() {
@@ -190,38 +164,40 @@ impl Desktop {
             }
             self.z_order[0] = slot;
         }
-        
+
         // Update focus
         if let Some(old_focused) = self.focused {
             if let Some(ref mut win) = self.windows[old_focused] {
                 win.flags.focused = false;
             }
         }
-        
+
         if let Some(ref mut win) = self.windows[slot] {
             win.flags.focused = true;
         }
-        
+
         self.focused = Some(slot);
         self.dirty = true;
     }
-    
+
     /// Handle mouse movement
     pub fn handle_mouse_move(&mut self, x: i32, y: i32) {
         self.mouse_x = x.max(0).min(self.screen_width as i32 - 1);
         self.mouse_y = y.max(0).min(self.screen_height as i32 - 1);
-        
+
         // Handle dragging
         if let Some(slot) = self.dragging {
             if let Some(ref mut window) = self.windows[slot] {
                 let new_x = self.mouse_x - self.drag_offset.x;
                 let new_y = self.mouse_y - self.drag_offset.y;
                 window.move_to(new_x, new_y);
-                self.dirty = true;
+                self.dirty = true;  // Windows moved, need to redraw them
             }
         }
+        // Note: We do NOT set dirty just for cursor movement!
+        // Cursor is drawn separately every frame.
     }
-    
+
     /// Handle mouse button
     pub fn handle_mouse_button(&mut self, button: MouseButton, pressed: bool) {
         let bit = match button {
@@ -229,17 +205,17 @@ impl Desktop {
             MouseButton::Middle => 2,
             MouseButton::Right => 4,
         };
-        
+
         if pressed {
             self.mouse_buttons |= bit;
-            
+
             // Check what we clicked on
             if let Some(slot) = self.window_at(self.mouse_x, self.mouse_y) {
                 // Bring to front if not already focused
                 if self.focused != Some(slot) {
                     self.bring_to_front(slot);
                 }
-                
+
                 // Check if clicking title bar (start drag)
                 if let Some(ref window) = self.windows[slot] {
                     if button == MouseButton::Left && window.in_title_bar(self.mouse_x, self.mouse_y) {
@@ -253,14 +229,14 @@ impl Desktop {
             }
         } else {
             self.mouse_buttons &= !bit;
-            
+
             // Stop dragging
             if button == MouseButton::Left {
                 self.dragging = None;
             }
         }
     }
-    
+
     /// Handle keyboard input
     pub fn handle_key(&mut self, key: char, pressed: bool) {
         // Forward to focused window (would go through EventChain in full implementation)
@@ -270,12 +246,12 @@ impl Desktop {
             }
         }
     }
-    
-    /// Save pixels under cursor
+
+    /// Save pixels under cursor from front buffer
     fn save_cursor_area(&mut self, fb: &Framebuffer) {
         let x = self.mouse_x;
         let y = self.mouse_y;
-        
+
         for cy in 0..CURSOR_HEIGHT as i32 {
             for cx in 0..CURSOR_WIDTH as i32 {
                 let idx = (cy * CURSOR_WIDTH as i32 + cx) as usize;
@@ -285,20 +261,20 @@ impl Desktop {
                 }
             }
         }
-        
+
         self.cursor_save_x = x;
         self.cursor_save_y = y;
     }
-    
-    /// Restore pixels under cursor
+
+    /// Restore pixels under cursor to front buffer
     fn restore_cursor_area(&self, fb: &mut Framebuffer) {
         if self.cursor_save_x < 0 {
             return;
         }
-        
+
         let x = self.cursor_save_x;
         let y = self.cursor_save_y;
-        
+
         for cy in 0..CURSOR_HEIGHT as i32 {
             for cx in 0..CURSOR_WIDTH as i32 {
                 let idx = (cy * CURSOR_WIDTH as i32 + cx) as usize;
@@ -308,23 +284,24 @@ impl Desktop {
             }
         }
     }
-    
-    /// Draw cursor at current position
+
+    /// Draw cursor at current position to front buffer
     fn draw_cursor(&mut self, fb: &mut Framebuffer) {
+        // Save what's under the cursor BEFORE drawing
         self.save_cursor_area(fb);
-        
+
         let x = self.mouse_x;
         let y = self.mouse_y;
-        
+
         for cy in 0..16i32 {
             let bitmap_row = CURSOR_BITMAP[cy as usize];
             let mask_row = CURSOR_MASK[cy as usize];
-            
+
             for cx in 0..16i32 {
                 let bit = 15 - cx;
                 let mask_bit = (mask_row >> bit) & 1;
                 let color_bit = (bitmap_row >> bit) & 1;
-                
+
                 if mask_bit != 0 {
                     let color = if color_bit != 0 {
                         Color::WHITE
@@ -336,45 +313,62 @@ impl Desktop {
             }
         }
     }
-    
-    /// Draw the entire desktop
-    pub fn draw(&mut self, fb: &mut Framebuffer) {
+
+    /// Render windows to back buffer (no cursor)
+    fn render_to_back_buffer(&self, back_buffer: &mut Framebuffer) {
         let theme = theme::current();
-        
-        // Restore cursor area first
-        self.restore_cursor_area(fb);
-        
-        if self.dirty {
-            // Draw desktop background
-            fb.clear(theme.desktop_bg);
-            
-            // Draw windows back to front
-            for i in (0..self.window_count).rev() {
-                let slot = self.z_order[i];
-                if let Some(ref window) = self.windows[slot] {
-                    if window.flags.visible {
-                        window.draw(fb);
-                    }
+
+        // Clear background
+        back_buffer.clear(theme.desktop_bg);
+
+        // Draw windows back to front
+        for i in (0..self.window_count).rev() {
+            let slot = self.z_order[i];
+            if let Some(ref window) = self.windows[slot] {
+                if window.flags.visible {
+                    window.draw(back_buffer);
                 }
             }
-            
+        }
+        // NOTE: No cursor drawn here! Cursor goes directly to front buffer.
+    }
+
+    /// Draw with double buffering for windows, direct draw for cursor
+    ///
+    /// This gives flicker-free window updates AND smooth cursor movement.
+    ///
+    /// Call this from your main loop with both buffers.
+    pub fn draw(&mut self, back_buffer: &mut Framebuffer, front_buffer: &mut Framebuffer) {
+        // Step 1: Restore old cursor area on front buffer
+        // (This erases the cursor from its previous position)
+        self.restore_cursor_area(front_buffer);
+
+        // Step 2: If windows changed, re-render to back buffer and copy
+        if self.dirty {
+            // Render background + windows to back buffer (no cursor)
+            self.render_to_back_buffer(back_buffer);
+
+            // Copy entire back buffer to front buffer (atomic, no flicker)
+            front_buffer.copy_from(back_buffer);
+
             self.dirty = false;
         }
-        
-        // Always draw cursor on top
-        self.draw_cursor(fb);
+
+        // Step 3: Draw cursor directly to front buffer
+        // This happens every frame for smooth cursor movement
+        self.draw_cursor(front_buffer);
     }
-    
-    /// Mark desktop as dirty
+
+    /// Mark desktop as dirty (windows need redraw)
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
-    
+
     /// Get mouse position
     pub fn mouse_pos(&self) -> (i32, i32) {
         (self.mouse_x, self.mouse_y)
     }
-    
+
     /// Get focused window ID
     pub fn focused_window(&self) -> Option<u32> {
         self.focused.and_then(|slot| {
