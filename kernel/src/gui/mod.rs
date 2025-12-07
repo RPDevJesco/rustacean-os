@@ -1,17 +1,28 @@
 //! GUI Subsystem - Plan 9 rio-style windowing
 //!
 //! Provides a simple, clean graphical interface inspired by Plan 9's rio.
+//!
+//! # EventChain Integration
+//!
+//! Discrete window lifecycle events (create, destroy, focus, z-order) are
+//! dispatched through the Window Manager EventChain for policy enforcement
+//! and audit logging.
+//!
+//! Continuous events (mouse tracking, frame rendering) are handled directly
+//! for performance reasons.
 
 pub mod font;
 pub mod framebuffer;
 pub mod window;
 pub mod desktop;
 pub mod theme;
+pub mod wm_events;
 
 pub use framebuffer::Framebuffer;
 pub use window::Window;
 pub use desktop::Desktop;
 pub use theme::Theme;
+pub use wm_events::WmEventDispatcher;
 
 /// GUI Event types
 #[derive(Debug, Clone, Copy)]
@@ -24,7 +35,7 @@ pub enum GuiEvent {
     MouseUp { x: i32, y: i32, button: MouseButton },
     /// Key pressed
     KeyDown { key: char, scancode: u8 },
-    /// Key released  
+    /// Key released
     KeyUp { key: char, scancode: u8 },
     /// Window needs redraw
     Redraw,
@@ -53,16 +64,16 @@ impl Rect {
     pub const fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
         Self { x, y, width, height }
     }
-    
+
     pub fn contains(&self, px: i32, py: i32) -> bool {
         px >= self.x && px < self.x + self.width as i32 &&
-        py >= self.y && py < self.y + self.height as i32
+            py >= self.y && py < self.y + self.height as i32
     }
-    
+
     pub fn right(&self) -> i32 {
         self.x + self.width as i32
     }
-    
+
     pub fn bottom(&self) -> i32 {
         self.y + self.height as i32
     }
@@ -93,7 +104,7 @@ impl Color {
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
-    
+
     pub const fn from_u32(val: u32) -> Self {
         Self {
             r: ((val >> 16) & 0xFF) as u8,
@@ -101,11 +112,11 @@ impl Color {
             b: (val & 0xFF) as u8,
         }
     }
-    
+
     pub const fn to_u32(&self) -> u32 {
         ((self.r as u32) << 16) | ((self.g as u32) << 8) | (self.b as u32)
     }
-    
+
     // Plan 9 inspired colors
     pub const BLACK: Color = Color::rgb(0, 0, 0);
     pub const WHITE: Color = Color::rgb(255, 255, 255);

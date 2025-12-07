@@ -2,10 +2,28 @@
 //!
 //! This is where the bootloader hands off control to the kernel.
 //! We're in 32-bit protected mode with a flat memory model.
+//!
+//! # EventChains Architecture
+//!
+//! Rustacean OS uses EventChains for three distinct purposes:
+//!
+//! 1. **Driver EventChain** (boot time) - Fault-tolerant driver initialization
+//!    with graceful degradation when optional drivers fail.
+//!
+//! 2. **Kernel EventChain** (runtime) - Syscall processing with permission
+//!    checking, audit logging, and error handling middleware.
+//!
+//! 3. **Window Manager EventChain** (runtime) - Discrete window lifecycle
+//!    events (create, destroy, focus, z-order) with policy enforcement.
+//!
+//! Hot paths (mouse tracking, frame rendering, scheduler) stay outside
+//! EventChains for performance.
 
 #![no_std]
 #![no_main]
 #![allow(dead_code)]
+
+extern crate alloc;
 
 // Core kernel modules
 mod boot_info;
@@ -83,9 +101,13 @@ extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
         vga.add(1).write_volatile(0x2F);
     }
 
+    // Initialize heap allocator (enables Box, Vec, String)
+    unsafe {
+        mm::heap::init();
+    }
+
     // Verify boot magic
     if !boot_info.verify_magic() {
-        // Debug: Write 'X' - magic failed
         unsafe {
             let vga = 0xB800A as *mut u8;
             vga.write_volatile(b'X');
@@ -103,7 +125,7 @@ extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
         vga.add(1).write_volatile(0x2F);
     }
 
-    // Initialize VGA/VESA display (temporary, for boot messages)
+    // Initialize VGA/VESA display for boot messages
     unsafe {
         if boot_info.vesa_enabled {
             vga::init_framebuffer(
@@ -124,21 +146,19 @@ extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
     let _ = writeln!(writer, "");
     let _ = writeln!(writer, "========================================");
     let _ = writeln!(writer, "    RUSTACEAN OS v0.1.0");
-    let _ = writeln!(writer, "    A Plan 9-style GUI Operating System");
+    let _ = writeln!(writer, "    EventChains Architecture");
     let _ = writeln!(writer, "========================================");
     let _ = writeln!(writer, "");
 
     // Display boot info
-    let _ = writeln!(writer, "[BOOT] Magic verified: 0x{:08X}", boot_info.magic);
     let _ = writeln!(writer, "[BOOT] Display: {}x{} @ {}bpp",
                      boot_info.screen_width,
                      boot_info.screen_height,
                      boot_info.bits_per_pixel
     );
     let _ = writeln!(writer, "[BOOT] Framebuffer: 0x{:08X}", boot_info.framebuffer_addr);
-    let _ = writeln!(writer, "[BOOT] E820 map at: 0x{:08X}", boot_info.e820_map_addr);
 
-    // Initialize GDT (our own, replacing bootloader's)
+    // Initialize GDT
     let _ = write!(writer, "[INIT] Loading GDT...");
     gdt::init();
     let _ = writeln!(writer, " OK");
@@ -162,12 +182,39 @@ extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
     unsafe { core::arch::asm!("sti"); }
     let _ = writeln!(writer, " OK");
 
-    let _ = writeln!(writer, "");
-    let _ = writeln!(writer, "[READY] Rustacean OS kernel initialized!");
-    let _ = writeln!(writer, "[READY] EventChains architecture active.");
-
     // If we have VESA graphics, start the GUI
     if boot_info.vesa_enabled && boot_info.screen_width > 0 {
+        let _ = writeln!(writer, "");
+        let _ = writeln!(writer, "[DRV ] Initializing drivers via EventChain...");
+
+        // Use Driver EventChain for fault-tolerant initialization
+        let drv_result = drivers::init_all_drivers(
+            boot_info.framebuffer_addr,
+            boot_info.screen_width,
+            boot_info.screen_height,
+            boot_info.bits_per_pixel / 8,
+            boot_info.pitch,
+        );
+
+        // Report driver initialization results
+        let _ = writeln!(writer, "[DRV ] GPU: {}", drv_result.gpu_type_str());
+        let _ = writeln!(writer, "[DRV ] Input: {}", drv_result.input_type_str());
+        let _ = writeln!(writer, "[DRV ] Hardware cursor: {}",
+                         if drv_result.hw_cursor { "yes" } else { "no" });
+
+        // Report any failures (non-fatal in BestEffort mode)
+        if drv_result.failure_count > 0 {
+            let _ = writeln!(writer, "[DRV ] Failures (non-fatal):");
+            for i in 0..drv_result.failure_count {
+                if let Some(name) = drv_result.failures[i] {
+                    let _ = writeln!(writer, "[DRV ]   - {}", name);
+                }
+            }
+        }
+
+        let _ = writeln!(writer, "");
+        let _ = writeln!(writer, "[READY] Rustacean OS kernel initialized!");
+        let _ = writeln!(writer, "[READY] EventChains: Driver, Kernel, WindowManager");
         let _ = writeln!(writer, "[GUI  ] Starting graphical interface...");
 
         // Small delay to show messages
@@ -175,19 +222,9 @@ extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
             unsafe { core::arch::asm!("nop"); }
         }
 
-        run_gui(
-            boot_info.framebuffer_addr,
-            boot_info.screen_width,
-            boot_info.screen_height,
-            boot_info.bits_per_pixel / 8, // bytes per pixel
-            boot_info.pitch,
-        );
+        run_gui(drv_result);
     } else {
         let _ = writeln!(writer, "[TEXT] Running in text mode - no GUI available");
-        let _ = writeln!(writer, "");
-        let _ = writeln!(writer, "Press any key to test keyboard...");
-
-        // Simple text mode loop - just show we're alive
         loop {
             unsafe { core::arch::asm!("hlt"); }
         }
@@ -199,206 +236,159 @@ extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
 // =============================================================================
 static mut BACK_BUFFER_DATA: [u8; 800 * 600 * 4] = [0u8; 800 * 600 * 4];
 
-/// Run the graphical user interface with double buffering
+/// Run the graphical user interface
 ///
-/// Key improvements over single-buffer approach:
-/// 1. Double buffering - windows drawn to back buffer, then copied atomically
-/// 2. Cursor drawn directly to front buffer for smooth movement
-/// 3. No flicker during window dragging
-fn run_gui(fb_addr: u32, width: u32, height: u32, bpp: u32, pitch: u32) -> ! {
-    // Track which drivers we're using
-    let mut using_native_gpu = false;
-    let mut using_synaptics = false;
-
-    // Final framebuffer parameters (may be updated by native GPU driver)
-    let mut final_fb_addr = fb_addr;
-    let mut final_width = width;
-    let mut final_height = height;
-    let mut final_bpp = bpp;
-    let mut final_pitch = pitch;
-
-    // =========================================================================
-    // Try to initialize native ATI Rage Mobility P GPU driver
-    // =========================================================================
-    match drivers::ati_rage::init() {
-        Ok(()) => {
-            if let Some(gpu) = drivers::ati_rage::get() {
-                // Try to set our preferred mode (800x600 for Plan 9 style)
-                let mode = drivers::ati_rage::DisplayMode::mode_800x600_60();
-                match gpu.set_mode(&mode, 32) {
-                    Ok(()) => {
-                        // Update framebuffer parameters from native driver
-                        final_fb_addr = gpu.framebuffer_addr();
-                        final_width = gpu.width();
-                        final_height = gpu.height();
-                        final_bpp = gpu.bpp() / 8;
-                        final_pitch = gpu.pitch();
-                        using_native_gpu = true;
-
-                        // Enable hardware cursor for flicker-free pointer
-                        gpu.enable_hw_cursor();
-                    }
-                    Err(_e) => {
-                        // Mode set failed, continue with VESA framebuffer
-                    }
-                }
-            }
-        }
-        Err(_e) => {
-            // ATI Rage not found or init failed, continue with VESA
-        }
-    }
-
-    // =========================================================================
-    // Initialize front buffer (actual screen - VRAM)
-    // =========================================================================
-    unsafe {
-        gui::framebuffer::init(
-            final_fb_addr as *mut u8,
-            final_width,
-            final_height,
-            final_bpp,
-            final_pitch
-        );
-    }
-
-    // =========================================================================
-    // Initialize back buffer (in regular RAM - for double buffering)
-    // =========================================================================
+/// Uses:
+/// - Driver EventChain results for display/input configuration
+/// - Window Manager EventChain for discrete window events
+/// - Direct calls for hot path (mouse tracking, rendering)
+fn run_gui(drv: drivers::DriverInitResult) -> ! {
+    // Create back buffer for double buffering
     let mut back_buffer = unsafe {
         gui::Framebuffer::new(
             BACK_BUFFER_DATA.as_mut_ptr(),
-            final_width,
-            final_height,
-            final_bpp,
-            final_pitch,
+            drv.width,
+            drv.height,
+            drv.bpp,
+            drv.pitch,
         )
     };
 
-    // =========================================================================
-    // Try to initialize Synaptics touchpad, fall back to generic PS/2 mouse
-    // =========================================================================
-    match drivers::synaptics::init(final_width, final_height) {
-        Ok(()) => {
-            if drivers::synaptics::is_synaptics() {
-                using_synaptics = true;
-                // Optionally configure touchpad settings
-                unsafe {
-                    drivers::synaptics::TOUCHPAD.set_tap_enabled(true);
-                    drivers::synaptics::TOUCHPAD.set_sensitivity(300);
-                }
-            } else {
-                // Detected as generic PS/2 mouse via Synaptics driver
-                using_synaptics = true; // Still use synaptics driver in relative mode
-            }
-        }
-        Err(_e) => {
-            // Synaptics init failed, fall back to original mouse driver
-            drivers::mouse::init(final_width, final_height);
-            using_synaptics = false;
-        }
-    }
-
-    // =========================================================================
-    // Initialize desktop window manager
-    // =========================================================================
-    gui::desktop::init(final_width, final_height);
+    // Initialize desktop window manager with hardware cursor support
+    gui::desktop::init_with_hw_cursor(drv.width, drv.height, drv.hw_cursor);
 
     let desktop = gui::desktop::get().expect("Desktop not initialized");
     let fb = gui::framebuffer::get().expect("Framebuffer not initialized");
 
-    // Create demo windows
-    desktop.create_window("Welcome to Rustacean OS!", 50, 50, 450, 250);
-    desktop.create_window("Terminal", 100, 150, 500, 300);
-    desktop.create_window("Files", 520, 80, 300, 250);
+    // Create demo windows (goes through WM EventChain)
+    desktop.create_window("Welcome to Rustacean OS!", 50, 50, 450, 220);
+    desktop.create_terminal_window(100, 280, 400, 180);  // Heap-allocated terminal!
+    desktop.create_window("Files", 470, 50, 300, 220);
 
     desktop.mark_dirty();
 
     // =========================================================================
-    // Main GUI event loop
+    // Main GUI event loop (Polling Mode)
     // =========================================================================
-    let mut last_mouse_x = (final_width / 2) as i32;
-    let mut last_mouse_y = (final_height / 2) as i32;
+
+    // Disable keyboard (IRQ1) and mouse (IRQ12) interrupts - we'll poll instead
+    // This avoids race conditions between IRQ handlers and our polling loop
+    unsafe {
+        // Disable IRQ1 (keyboard) on master PIC
+        let mask = crate::arch::x86::io::inb(0x21);
+        crate::arch::x86::io::outb(0x21, mask | 0x02);  // Set bit 1
+
+        // Disable IRQ12 (mouse) on slave PIC
+        let mask = crate::arch::x86::io::inb(0xA1);
+        crate::arch::x86::io::outb(0xA1, mask | 0x10);  // Set bit 4
+    }
+
+    let mut last_mouse_x = (drv.width / 2) as i32;
+    let mut last_mouse_y = (drv.height / 2) as i32;
     let mut last_buttons = 0u8;
 
-    // Keyboard-controlled cursor (fallback for non-working touchpad)
+    // Keyboard-controlled cursor (fallback)
     let mut kb_cursor_x = last_mouse_x;
     let mut kb_cursor_y = last_mouse_y;
     let cursor_speed = 8i32;
 
+    let using_synaptics = drv.is_synaptics();
+    let using_ati_rage = drv.is_ati_rage();
+
     loop {
         // =====================================================================
-        // Handle keyboard input (fallback cursor control + future use)
+        // Poll PS/2 controller - route keyboard and mouse data to drivers
         // =====================================================================
-        let scancode = unsafe {
+        unsafe {
             let status = crate::arch::x86::io::inb(0x64);
+
+            // Check if output buffer has data (bit 0)
             if status & 0x01 != 0 {
-                Some(crate::arch::x86::io::inb(0x60))
-            } else {
-                None
-            }
-        };
+                let data = crate::arch::x86::io::inb(0x60);
 
-        if let Some(code) = scancode {
-            let pressed = code & 0x80 == 0;
-            let key = code & 0x7F;
-
-            if pressed {
-                match key {
-                    // Arrow keys
-                    0x48 => { // Up
-                        kb_cursor_y = (kb_cursor_y - cursor_speed).max(0);
-                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
+                // Bit 5 tells us if it's from auxiliary device (mouse/touchpad)
+                if status & 0x20 == 0 {
+                    // Keyboard data - process through keyboard driver
+                    drivers::keyboard::KEYBOARD.process_scancode(data);
+                } else {
+                    // Mouse/touchpad data - route to appropriate driver
+                    if using_synaptics {
+                        drivers::synaptics::handle_irq_byte(data);
+                    } else {
+                        drivers::mouse::MOUSE.process_byte(data);
                     }
-                    0x50 => { // Down
-                        kb_cursor_y = (kb_cursor_y + cursor_speed).min(final_height as i32 - 1);
-                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
-                    }
-                    0x4B => { // Left
-                        kb_cursor_x = (kb_cursor_x - cursor_speed).max(0);
-                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
-                    }
-                    0x4D => { // Right
-                        kb_cursor_x = (kb_cursor_x + cursor_speed).min(final_width as i32 - 1);
-                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
-                    }
-                    0x1C => { // Enter = left click
-                        desktop.handle_mouse_button(gui::MouseButton::Left, true);
-                        for _ in 0..100000u32 { unsafe { core::arch::asm!("nop"); } }
-                        desktop.handle_mouse_button(gui::MouseButton::Left, false);
-                    }
-                    0x39 => { // Space = left click (hold for drag)
-                        desktop.handle_mouse_button(gui::MouseButton::Left, true);
-                    }
-                    // WASD as alternative cursor control
-                    0x11 => { // W
-                        kb_cursor_y = (kb_cursor_y - cursor_speed).max(0);
-                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
-                    }
-                    0x1F => { // S
-                        kb_cursor_y = (kb_cursor_y + cursor_speed).min(final_height as i32 - 1);
-                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
-                    }
-                    0x1E => { // A
-                        kb_cursor_x = (kb_cursor_x - cursor_speed).max(0);
-                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
-                    }
-                    0x20 => { // D
-                        kb_cursor_x = (kb_cursor_x + cursor_speed).min(final_width as i32 - 1);
-                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
-                    }
-                    _ => {}
-                }
-            } else {
-                // Key released
-                if key == 0x39 { // Space released = end drag
-                    desktop.handle_mouse_button(gui::MouseButton::Left, false);
                 }
             }
         }
 
         // =====================================================================
-        // Handle pointing device input (Synaptics or generic PS/2)
+        // Handle keyboard input - poll driver buffer
+        // =====================================================================
+        while let Some(key) = drivers::keyboard::get_key() {
+            use drivers::keyboard::KeyCode;
+
+            if desktop.is_terminal_focused() {
+                // Terminal input mode
+                match key.keycode {
+                    KeyCode::Enter => desktop.term_enter(),
+                    KeyCode::Backspace => desktop.term_backspace(),
+                    KeyCode::Up => {
+                        kb_cursor_y = (kb_cursor_y - cursor_speed).max(0);
+                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
+                    }
+                    KeyCode::Down => {
+                        kb_cursor_y = (kb_cursor_y + cursor_speed).min(drv.height as i32 - 1);
+                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
+                    }
+                    KeyCode::Left => {
+                        kb_cursor_x = (kb_cursor_x - cursor_speed).max(0);
+                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
+                    }
+                    KeyCode::Right => {
+                        kb_cursor_x = (kb_cursor_x + cursor_speed).min(drv.width as i32 - 1);
+                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
+                    }
+                    _ => {
+                        // Send printable characters to terminal
+                        if let Some(c) = key.ascii {
+                            desktop.term_key_input(c);
+                        }
+                    }
+                }
+            } else {
+                // Window navigation mode
+                match key.keycode {
+                    KeyCode::Up | KeyCode::W => {
+                        kb_cursor_y = (kb_cursor_y - cursor_speed).max(0);
+                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
+                    }
+                    KeyCode::Down | KeyCode::S => {
+                        kb_cursor_y = (kb_cursor_y + cursor_speed).min(drv.height as i32 - 1);
+                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
+                    }
+                    KeyCode::Left | KeyCode::A => {
+                        kb_cursor_x = (kb_cursor_x - cursor_speed).max(0);
+                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
+                    }
+                    KeyCode::Right | KeyCode::D => {
+                        kb_cursor_x = (kb_cursor_x + cursor_speed).min(drv.width as i32 - 1);
+                        desktop.handle_mouse_move(kb_cursor_x, kb_cursor_y);
+                    }
+                    KeyCode::Enter => unsafe {
+                        desktop.handle_mouse_button(gui::MouseButton::Left, true);
+                        for _ in 0..100000u32 { core::arch::asm!("nop"); }
+                        desktop.handle_mouse_button(gui::MouseButton::Left, false);
+                    }
+                    KeyCode::Space => {
+                        desktop.handle_mouse_button(gui::MouseButton::Left, true);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // =====================================================================
+        // Handle pointing device input (direct - hot path)
         // =====================================================================
         let (mouse_x, mouse_y, buttons) = if using_synaptics {
             let (x, y) = drivers::synaptics::get_position();
@@ -410,16 +400,12 @@ fn run_gui(fb_addr: u32, width: u32, height: u32, bpp: u32, pitch: u32) -> ! {
             (x, y, btns)
         };
 
-        // Handle pointer movement
         if mouse_x != last_mouse_x || mouse_y != last_mouse_y {
             desktop.handle_mouse_move(mouse_x, mouse_y);
-
-            // Sync keyboard cursor with pointer
             kb_cursor_x = mouse_x;
             kb_cursor_y = mouse_y;
 
-            // Update hardware cursor if using native GPU
-            if using_native_gpu {
+            if using_ati_rage {
                 if let Some(gpu) = drivers::ati_rage::get() {
                     gpu.set_cursor_pos(mouse_x, mouse_y);
                 }
@@ -429,7 +415,6 @@ fn run_gui(fb_addr: u32, width: u32, height: u32, bpp: u32, pitch: u32) -> ! {
             last_mouse_y = mouse_y;
         }
 
-        // Handle button changes
         if buttons != last_buttons {
             if (buttons & 0x01) != (last_buttons & 0x01) {
                 desktop.handle_mouse_button(gui::MouseButton::Left, buttons & 0x01 != 0);
@@ -444,14 +429,11 @@ fn run_gui(fb_addr: u32, width: u32, height: u32, bpp: u32, pitch: u32) -> ! {
         }
 
         // =====================================================================
-        // Draw the desktop with DOUBLE BUFFERING
+        // Draw the desktop (direct - hot path, double buffered)
         // =====================================================================
-        // - Windows are drawn to back_buffer, then copied to fb (front buffer)
-        // - Cursor is drawn directly to fb for smooth movement
-        // - No flicker during window dragging!
         desktop.draw(&mut back_buffer, fb);
 
-        // Small yield to prevent CPU spinning at 100%
+        // Small yield
         for _ in 0..10000u32 {
             unsafe { core::arch::asm!("nop"); }
         }

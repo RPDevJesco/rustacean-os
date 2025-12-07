@@ -132,15 +132,62 @@ After building, the `output/` directory contains:
 ## Memory Layout
 
 ```
-0x00000000 - 0x000004FF  BIOS/Boot data
-0x00000500 - 0x000005FF  Boot Info Structure
-0x00001000 - 0x00001FFF  E820 Memory Map
-0x00007C00 - 0x00007DFF  Stage 1 Bootloader
-0x00007E00 - 0x0000BDFF  Stage 2 Bootloader
-0x00090000 - 0x0009FFFF  Stack (grows down)
-0x000A0000 - 0x000BFFFF  VGA Memory
-0x000C0000 - 0x000FFFFF  ROM Area
-0x00100000 - ...         Kernel (loaded at 1MB)
+Address         Size        Description
+─────────────────────────────────────────────────────────────────────
+0x0000_0000    1 KB        Real Mode IVT (Interrupt Vector Table)
+0x0000_0400    256 B       BIOS Data Area (BDA)
+0x0000_0500    ~30 KB      Free (conventional memory)
+0x0000_7C00    512 B       Bootloader Stage 1 (MBR)
+0x0000_7E00    ~480 KB     Free / Bootloader Stage 2
+─────────────────────────────────────────────────────────────────────
+0x000A_0000    64 KB       Video RAM (VGA legacy)
+0x000B_0000    32 KB       Monochrome text (unused)
+0x000B_8000    32 KB       Color text mode buffer
+0x000C_0000    256 KB      Video BIOS ROM / Option ROMs
+─────────────────────────────────────────────────────────────────────
+0x000F_0000    64 KB       System BIOS ROM
+─────────────────────────────────────────────────────────────────────
+                           ══════════════════════════════════
+0x0010_0000    ~3 MB       KERNEL CODE & DATA (1MB mark)
+(1 MB)                     - .text (code)
+                           - .rodata (constants, font data)
+                           - .data (initialized globals)
+                           - .bss (uninitialized globals)
+                           - Stack (grows down, limited!)
+─────────────────────────────────────────────────────────────────────
+0x0040_0000                [Previously attempted heap - crashed]
+(4 MB)
+─────────────────────────────────────────────────────────────────────
+                           ══════════════════════════════════
+0x0100_0000    4 MB        HEAP (16MB mark) ← Working!
+(16 MB)                    - Box<Terminal>
+                           - Vec<String> (terminal lines)
+                           - String (input buffer)
+                           - Future app allocations
+                           ══════════════════════════════════
+0x0140_0000                End of heap (20MB mark)
+(20 MB)
+─────────────────────────────────────────────────────────────────────
+0x0140_0000    ~44 MB      FREE RAM (available for future use)
+to                         - User processes
+0x0400_0000                - File cache
+(64 MB)                    - Additional heaps
+─────────────────────────────────────────────────────────────────────
+0x0400_0000    ~192 MB     MORE FREE RAM
+to                         (if ATI Rage framebuffer is elsewhere)
+0x1000_0000
+(256 MB)
+═════════════════════════════════════════════════════════════════════
+                           HARDWARE MAPPED MEMORY
+─────────────────────────────────────────────────────────────────────
+0xA000_0000    ?           ATI Rage Mobility P Framebuffer
+(~2.5 GB)                  (PCI BAR0 - varies by system)
+                           800x600x32bpp = ~1.9 MB
+
+0xFEC0_0000                I/O APIC (if present)
+0xFEE0_0000                Local APIC (if present)
+0xFFFF_0000    64 KB       High BIOS area (shadowed)
+─────────────────────────────────────────────────────────────────────
 ```
 
 ## Boot Info Structure (at 0x500)

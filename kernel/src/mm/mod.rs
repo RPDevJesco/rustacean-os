@@ -6,6 +6,8 @@
 pub mod intrusive;
 pub mod pmm;
 
+pub mod heap;
+
 use crate::boot_info::{E820Map, E820Type};
 
 /// Memory information returned by init
